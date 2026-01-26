@@ -3,16 +3,20 @@
 #include "Arduino_GFX_Library.h"
 #include "TouchDrvGT911.hpp"
 #include <SPI.h>
-
 #include <WiFi.h>
 #include <WiFiMulti.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
-#include <Arduino_GFX_Library.h>
-
 #include "HWCDC.h"
 
 HWCDC USBSerial;
+
+// --- BACKLIGHT & EXPANDER ---
+#define TCA9554_ADDR 0x24
+#define CONFIG_REG 0x03
+#define OUTPUT_REG 0x01
+unsigned long lastTouchTime = 0;
+#define SLEEP_TIMEOUT 30000  // 2 minutes in milliseconds
 
 TouchDrvGT911 GT911;
 int16_t x[5], y[5];
@@ -36,7 +40,7 @@ Arduino_RGB_Display *gfx = new Arduino_RGB_Display(
 
 // --- MULTI-WIFI SETUP ---
 WiFiMulti wifiMulti;
-#define WIFI_PASS1 "welcome1"  // Assuming shared pass, otherwise add individually
+#define WIFI_PASS1 "welcome1"   // Assuming shared pass, otherwise add individually
 #define WIFI_PASS2 "Welcome1!"  // Assuming shared pass, otherwise add individually
 #define DATA_URL "http://192.168.1.172/getSensorData"
 #define UPDATE_INTERVAL 60000
@@ -49,16 +53,23 @@ WiFiMulti wifiMulti;
 #define COL_WHITE 0xFFFF
 #define COL_RED 0xF800
 #define COL_GREEN 0x07E0
+
+#define COL_WHITE2 0x7BEF
+#define COL_RED2 0x7800
+#define COL_GREEN2 0x03E0
+
+
+
 #define COL_BLUE 0x001F
 #define COL_AXIS 0x7BEF
-#define SCREEN_W        480
-#define SCREEN_H        480
-#define MARGIN_LEFT     60
-#define MARGIN_RIGHT    60
-#define GRAPH_Y         140
-#define GRAPH_H         280
-#define GRAPH_W         (SCREEN_W - MARGIN_LEFT - MARGIN_RIGHT)
-#define MAX_HUMIDITY    101
+#define SCREEN_W 480
+#define SCREEN_H 480
+#define MARGIN_LEFT 60
+#define MARGIN_RIGHT 60
+#define GRAPH_Y 140
+#define GRAPH_H 300
+#define GRAPH_W (SCREEN_W - MARGIN_LEFT - MARGIN_RIGHT)
+#define MAX_HUMIDITY 101
 volatile bool isFetching = false;
 String globalJsonData = "";
 bool newDataAvailable = false;
@@ -79,6 +90,8 @@ void drawSpinnerFrame(int frame) {
 }
 
 // --- DATA RENDERING ENGINE ---
+#define COL_GREY 0x3186  // Dark Grey for Grid
+
 void performRender(String json) {
   DynamicJsonDocument doc(45000);
   if (deserializeJson(doc, json)) return;
@@ -95,7 +108,8 @@ void performRender(String json) {
   const char *labels[] = { "Inside", "Greenh", "Outside" };
   float temps[] = { s["insideTemp"], s["greenhouseTemp"], s["outsideTemp"] };
   int hums[] = { s["insideHumidity"], s["greenhouseHumidity"], s["outsideHumidity"] };
-  uint16_t rowColors[] = { COL_RED, COL_GREEN, COL_WHITE };
+  uint16_t rowColors[] = { COL_WHITE, COL_GREEN, COL_RED };
+  uint16_t rowColors2[] = { COL_WHITE2, COL_GREEN2, COL_RED2 };
 
   for (int i = 0; i < 3; i++) {
     gfx->setTextColor(rowColors[i]);
@@ -103,75 +117,131 @@ void performRender(String json) {
     gfx->printf("%-8s %4.1f C  %d%%", labels[i], temps[i], hums[i]);
   }
 
-  // 2. Multi-Array Scaling Logic
-  const char* tKeys[] = {"temp1", "temp2", "temp3"};
-  const char* hKeys[] = {"hum1", "hum2", "hum3"};
-  uint16_t hColors[] = { 0x001F, 0x07FF, 0xF81F }; // Blue, Cyan, Magenta for Humidities
-
-  float minT = 100, maxT = -100, minH = 100, maxH = 0;
-  int count = doc["temp1"].size(); 
+  // 2. Data Preparation
+  const char *tKeys[] = { "temp1", "temp2", "temp3" };
+  const char *hKeys[] = { "hum1", "hum2", "hum3" };
+  JsonArray timeLabels = doc["labels"];
+  int count = doc["temp1"].size();
   if (count < 2) return;
 
-  // Scan all 3 arrays to find global min/max for the Y-axis
+  float minT = 100, maxT = -100, minH = 100, maxH = 0;
   for (int j = 0; j < 3; j++) {
     JsonArray tArr = doc[tKeys[j]];
     JsonArray hArr = doc[hKeys[j]];
     for (int i = 0; i < tArr.size(); i++) {
-      float t = tArr[i]; float h = hArr[i];
-      if (t < minT) minT = t; if (t > maxT) maxT = t;
-      if (h < MAX_HUMIDITY) { 
-        if (h < minH) minH = h; 
-        if (h > maxH) maxH = h; 
+      float t = tArr[i];
+      float h = hArr[i];
+      if (t < minT) minT = t;
+      if (t > maxT) maxT = t;
+      if (h < MAX_HUMIDITY) {
+        if (h < minH) minH = h;
+        if (h > maxH) maxH = h;
       }
     }
   }
-  
-  // Add padding to margins
-  minT -= 1.0; maxT += 1.0;
-  minH -= 5.0; maxH += 5.0;
+  minT -= 1.0;
+  maxT += 1.0;
+  minH -= 5.0;
+  maxH += 5.0;
 
-  // 3. Draw Graph Box & Axis Labels
-  gfx->drawRect(MARGIN_LEFT, GRAPH_Y, GRAPH_W, GRAPH_H, COL_AXIS);
+  // 3. Grid Lines
+  // Vertical Grid - 3 Hour Intervals based on actual timestamp strings
+  int lastHour = -1;
+  for (int i = 0; i < count; i++) {
+    const char *ts = timeLabels[i];  // Format "24 Jan 10:58"
+    String timeStr = String(ts);
+    int colonPos = timeStr.indexOf(':');
+    if (colonPos != -1) {
+      int hour = timeStr.substring(colonPos - 2, colonPos).toInt();
+      // If hour is 0, 3, 6, 9... and it's a new hour block
+      if (hour % 3 == 0 && hour != lastHour) {
+        int gx = MARGIN_LEFT + (i * GRAPH_W / (count - 1));
+        gfx->drawFastVLine(gx, GRAPH_Y, GRAPH_H, COL_GREY);
+        lastHour = hour;
+      }
+    }
+  }
+
+  // Horizontal Grid - 10% steps
+  for (int i = 0; i <= 10; i++) {
+    int gy = (GRAPH_Y + GRAPH_H) - (i * GRAPH_H / 10);
+    gfx->drawFastHLine(MARGIN_LEFT, gy, GRAPH_W, COL_GREY);
+  }
+
+  // 4. Axis Labels
   gfx->setTextSize(1);
-  gfx->setTextColor(COL_RED);
-  gfx->setCursor(MARGIN_LEFT - 45, GRAPH_Y); gfx->printf("%.1f", maxT);
-  gfx->setCursor(MARGIN_LEFT - 45, GRAPH_Y + GRAPH_H - 10); gfx->printf("%.1f", minT);
-  
-  gfx->setTextColor(COL_BLUE);
-  gfx->setCursor(MARGIN_LEFT + GRAPH_W + 5, GRAPH_Y); gfx->printf("%d%%", (int)maxH);
-  gfx->setCursor(MARGIN_LEFT + GRAPH_W + 5, GRAPH_Y + GRAPH_H - 10); gfx->printf("%d%%", (int)minH);
+  gfx->drawRect(MARGIN_LEFT, GRAPH_Y, GRAPH_W, GRAPH_H, COL_AXIS);
 
-  // 4. Plot All Lines
+  // Temperature Y Labels (Left) - every 20%
+  gfx->setTextColor(COL_WHITE);
+  for (int i = 0; i <= 5; i++) {
+    int ly = (GRAPH_Y + GRAPH_H) - (i * GRAPH_H / 5);
+    float val = minT + (i * (maxT - minT) / 5.0);
+    gfx->setCursor(MARGIN_LEFT - 45, ly - 4);
+    gfx->printf("%.1f", val);
+  }
+
+  // Humidity Y Labels (Right) - every 20%
+  gfx->setTextColor(COL_WHITE);
+  for (int i = 0; i <= 5; i++) {
+    int ly = (GRAPH_Y + GRAPH_H) - (i * GRAPH_H / 5);
+    float val = minH + (i * (maxH - minH) / 5.0);
+    gfx->setCursor(MARGIN_LEFT + GRAPH_W + 5, ly - 4);
+    gfx->printf("%d%%", (int)val);
+  }
+
+  // X Labels (Start, Mid, End)
+  gfx->setTextColor(COL_WHITE);
+  gfx->setCursor(MARGIN_LEFT, GRAPH_Y + GRAPH_H + 15);
+  gfx->print((const char *)timeLabels[0]);
+  gfx->setCursor(MARGIN_LEFT + (GRAPH_W / 2) - 40, GRAPH_Y + GRAPH_H + 15);
+  gfx->print((const char *)timeLabels[count / 2]);
+  gfx->setCursor(SCREEN_W - MARGIN_RIGHT - 85, GRAPH_Y + GRAPH_H + 15);
+  gfx->print((const char *)timeLabels[count - 1]);
+
+  // 5. Plotting
   for (int j = 0; j < 3; j++) {
     JsonArray tHist = doc[tKeys[j]];
     JsonArray hHist = doc[hKeys[j]];
-    uint16_t tCol = rowColors[j];
-    uint16_t hCol = hColors[j];
+    uint16_t color = rowColors[j];
+    uint16_t color2 = rowColors2[j];
 
     for (int i = 0; i < count - 1; i++) {
       int x0 = MARGIN_LEFT + (i * GRAPH_W / (count - 1));
       int x1 = MARGIN_LEFT + ((i + 1) * GRAPH_W / (count - 1));
 
-      // Plot Temperature
-      int yt0 = (GRAPH_Y + GRAPH_H) - (int)((float(tHist[i]) - minT) * GRAPH_H / (maxT - minT));
-      int yt1 = (GRAPH_Y + GRAPH_H) - (int)((float(tHist[i+1]) - minT) * GRAPH_H / (maxT - minT));
-      gfx->drawLine(x0, yt0, x1, yt1, tCol);
 
-      // Plot Humidity (with error check)
-      if (hHist[i] < MAX_HUMIDITY && hHist[i+1] < MAX_HUMIDITY) {
+      // Plot Humidity (Dotted)
+      if (hHist[i] < MAX_HUMIDITY && hHist[i + 1] < MAX_HUMIDITY) {
         int yh0 = (GRAPH_Y + GRAPH_H) - (int)((float(hHist[i]) - minH) * GRAPH_H / (maxH - minH));
-        int yh1 = (GRAPH_Y + GRAPH_H) - (int)((float(hHist[i+1]) - minH) * GRAPH_H / (maxH - minH));
-        gfx->drawLine(x0, yh0, x1, yh1, hCol);
+        int yh1 = (GRAPH_Y + GRAPH_H) - (int)((float(hHist[i + 1]) - minH) * GRAPH_H / (maxH - minH));
+
+        // Simple 2-segment dotted line for short spans
+        int xm = (x0 + x1) / 2;
+        int ym = (yh0 + yh1) / 2;
+        gfx->drawLine(x0, yh0, (x0 + xm) / 2, (yh0 + ym) / 2, color2);
+        gfx->drawLine(xm, ym, (xm + x1) / 2, (ym + yh1) / 2, color2);
       }
     }
   }
 
-  // 5. X-Axis Labels
-  gfx->setTextColor(COL_WHITE);
-  gfx->setCursor(MARGIN_LEFT, GRAPH_Y + GRAPH_H + 15);
-  gfx->print((const char*)doc["labels"][0]);
-  gfx->setCursor(SCREEN_W - MARGIN_RIGHT - 80, GRAPH_Y + GRAPH_H + 15);
-  gfx->print((const char*)doc["labels"][count-1]);
+  for (int j = 0; j < 3; j++) {
+    JsonArray tHist = doc[tKeys[j]];
+    JsonArray hHist = doc[hKeys[j]];
+    uint16_t color = rowColors[j];
+    uint16_t color2 = rowColors2[j];
+
+    for (int i = 0; i < count - 1; i++) {
+      int x0 = MARGIN_LEFT + (i * GRAPH_W / (count - 1));
+      int x1 = MARGIN_LEFT + ((i + 1) * GRAPH_W / (count - 1));
+
+      // Plot Temperature (Solid)
+      int yt0 = (GRAPH_Y + GRAPH_H) - (int)((float(tHist[i]) - minT) * GRAPH_H / (maxT - minT));
+      int yt1 = (GRAPH_Y + GRAPH_H) - (int)((float(tHist[i + 1]) - minT) * GRAPH_H / (maxT - minT));
+
+      gfx->drawLine(x0, yt0, x1, yt1, color);
+    }
+  }
 }
 
 // --- CORE 0: NETWORK TASK ---
@@ -262,10 +332,15 @@ void setup() {
 
   Wire.begin(15, 7);
 
-  Wire.beginTransmission(0x24);
-  Wire.write(0x03);
-  Wire.write(0x3a);
+  // Initialize Expander for Backlight
+  Wire.beginTransmission(TCA9554_ADDR);
+  Wire.write(CONFIG_REG);
+  Wire.write(0x3A);  // Ensure pin is output
   Wire.endTransmission();
+
+
+
+  lastTouchTime = millis();
 
   if (!init_gt911_with_probe(15, 7)) {
     while (1) {
@@ -303,21 +378,44 @@ void setup() {
   // Launch Background Task on Core 0
   xTaskCreatePinnedToCore(fetchTask, "FetchData", 10000, NULL, 1, &FetchTaskHandle, 0);
 }
-
+bool isAsleep = false;
 // --- LOOP (CORE 1) ---
 int spinnerFrame = 0;
 void loop() {
-    if (newDataAvailable) {
-        performRender(globalJsonData);
-        newDataAvailable = false;
+  // 1. Check for Touch to Wake/Reset Timer
+  if (GT911.isPressed() > 0) {
+    USBSerial.println("Touched");
+    if (isAsleep) {
+      USBSerial.println("Was asleep, now waking");
+      gfx->displayOn();
+      isAsleep = false;
+      // Force a re-render so the screen isn't black when it wakes
+      newDataAvailable = true;
     }
+    lastTouchTime = millis();
+  }
 
-    if (isFetching) {
-        drawSpinnerFrame(spinnerFrame++);
-        delay(60); 
-    } else {
-        delay(200);
-    }
+  // 2. Check for Sleep Timeout
+  if (!isAsleep && (millis() - lastTouchTime > SLEEP_TIMEOUT)) {
+    USBSerial.println("Sleep Time");
+    gfx->fillScreen(COL_BLACK);  // Manually black out the screen
+    gfx->displayOff();
+    isAsleep = true;
+  }
+
+  // 3. Handle Rendering (Only if awake)
+  if (newDataAvailable && !isAsleep) {
+    performRender(globalJsonData);
+    newDataAvailable = false;
+  }
+
+  // 4. Handle Spinner
+  if (isFetching && !isAsleep) {
+    drawSpinnerFrame(spinnerFrame++);
+    delay(20);
+  } else {
+    delay(50);  // Faster polling for touch response
+  }
 }
 
 
