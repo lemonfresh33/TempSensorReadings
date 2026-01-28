@@ -4,12 +4,18 @@
 #include "TouchDrvGT911.hpp"
 #include <SPI.h>
 #include <WiFi.h>
-#include <WiFiMulti.h>
+//#include <WiFiMulti.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include "HWCDC.h"
+#include "WiFiManager.h"
+#include "OTAUpdate.h"
+#include "FreeSansBold9pt7b.h"
+#include "FreeMono9pt7b.h"
 
 HWCDC USBSerial;
+WiFiManager wifiManager;
+OTAUpdate otaUpdater;
 
 // --- BACKLIGHT & EXPANDER ---
 #define TCA9554_ADDR 0x24
@@ -32,14 +38,13 @@ Arduino_ESP32RGBPanel *rgbpanel = new Arduino_ESP32RGBPanel(
   14 /* G0 */, 13 /* G1 */, 12 /* G2 */, 11 /* G3 */, 10 /* G4 */, 9 /* G5 */,
   5 /* B0 */, 45 /* B1 */, 48 /* B2 */, 47 /* B3 */, 21 /* B4 */,
   1 /* hsync_polarity */, 10 /* hsync_front_porch */, 8 /* hsync_pulse_width */, 60 /* hsync_back_porch */,
-  1 /* vsync_polarity */, 10 /* vsync_front_porch */, 8 /* vsync_pulse_width */, 30 /* vsync_back_porch */);
+  1 /* vsync_polarity */, 10 /* vsync_front_porch */, 8 /* vsync_pulse_width */, 40 /* vsync_back_porch */);
 Arduino_RGB_Display *gfx = new Arduino_RGB_Display(
   480 /* width */, 480 /* height */, rgbpanel, 2 /* rotation */, true /* auto_flush */,
   bus, GFX_NOT_DEFINED /* RST */, st7701_type1_init_operations, sizeof(st7701_type1_init_operations));
 
 
 // --- MULTI-WIFI SETUP ---
-WiFiMulti wifiMulti;
 #define WIFI_PASS1 "welcome1"   // Assuming shared pass, otherwise add individually
 #define WIFI_PASS2 "Welcome1!"  // Assuming shared pass, otherwise add individually
 #define DATA_URL "http://192.168.1.172/getSensorData"
@@ -97,12 +102,13 @@ void performRender(String json) {
   if (deserializeJson(doc, json)) return;
 
   gfx->fillScreen(COL_BLACK);
+gfx->setFont(&FreeMono9pt7b); // Set the custom font
 
   // 1. Header & Table Logic
   JsonObject s = doc["sensorData"];
-  gfx->setTextSize(2);
+  gfx->setTextSize(1);
   gfx->setTextColor(COL_WHITE);
-  gfx->setCursor(20, 20);
+  gfx->setCursor(20, 29);
   gfx->printf("%s", (const char *)s["time"]);
 
   const char *labels[] = { "Inside", "Greenh", "Outside" };
@@ -113,8 +119,16 @@ void performRender(String json) {
 
   for (int i = 0; i < 3; i++) {
     gfx->setTextColor(rowColors[i]);
-    gfx->setCursor(40, 60 + (i * 25));
-    gfx->printf("%-8s %4.1f C  %d%%", labels[i], temps[i], hums[i]);
+    gfx->setCursor(40, 69 + (i * 25));
+    if(i==0) 
+    {
+      gfx->printf("%-8s %4.1f C  %d%%", labels[i], temps[i], hums[i]);
+    }
+    else
+    {
+      gfx->printf("%-8s %4.1f C", labels[i], temps[i]);
+
+    }
   }
 
   // 2. Data Preparation
@@ -133,7 +147,7 @@ void performRender(String json) {
       float h = hArr[i];
       if (t < minT) minT = t;
       if (t > maxT) maxT = t;
-      if (h < MAX_HUMIDITY) {
+      if (h < MAX_HUMIDITY && (i <1)) {
         if (h < minH) minH = h;
         if (h > maxH) maxH = h;
       }
@@ -177,7 +191,7 @@ void performRender(String json) {
   for (int i = 0; i <= 5; i++) {
     int ly = (GRAPH_Y + GRAPH_H) - (i * GRAPH_H / 5);
     float val = minT + (i * (maxT - minT) / 5.0);
-    gfx->setCursor(MARGIN_LEFT - 45, ly - 4);
+    gfx->setCursor(MARGIN_LEFT - 45, 9+ ly - 4 );
     gfx->printf("%.1f", val);
   }
 
@@ -186,21 +200,21 @@ void performRender(String json) {
   for (int i = 0; i <= 5; i++) {
     int ly = (GRAPH_Y + GRAPH_H) - (i * GRAPH_H / 5);
     float val = minH + (i * (maxH - minH) / 5.0);
-    gfx->setCursor(MARGIN_LEFT + GRAPH_W + 5, ly - 4);
+    gfx->setCursor(MARGIN_LEFT + GRAPH_W + 5, 9+ ly - 4);
     gfx->printf("%d%%", (int)val);
   }
 
   // X Labels (Start, Mid, End)
   gfx->setTextColor(COL_WHITE);
-  gfx->setCursor(MARGIN_LEFT, GRAPH_Y + GRAPH_H + 15);
+  gfx->setCursor(MARGIN_LEFT, GRAPH_Y + GRAPH_H + 15 +9);
   gfx->print((const char *)timeLabels[0]);
-  gfx->setCursor(MARGIN_LEFT + (GRAPH_W / 2) - 40, GRAPH_Y + GRAPH_H + 15);
+  gfx->setCursor(MARGIN_LEFT + (GRAPH_W / 2) - 40, GRAPH_Y + GRAPH_H + 15 +9);
   gfx->print((const char *)timeLabels[count / 2]);
-  gfx->setCursor(SCREEN_W - MARGIN_RIGHT - 85, GRAPH_Y + GRAPH_H + 15);
+  gfx->setCursor(SCREEN_W - MARGIN_RIGHT - 85, GRAPH_Y + GRAPH_H + 15 +9);
   gfx->print((const char *)timeLabels[count - 1]);
 
   // 5. Plotting
-  for (int j = 0; j < 3; j++) {
+  for (int j = 0; j < 1; j++) {
     JsonArray tHist = doc[tKeys[j]];
     JsonArray hHist = doc[hKeys[j]];
     uint16_t color = rowColors[j];
@@ -248,7 +262,8 @@ void performRender(String json) {
 void fetchTask(void *pvParameters) {
   for (;;) {
     // Attempt to connect/reconnect to strongest WiFi
-    if (wifiMulti.run() == WL_CONNECTED) {
+    //if (wifiMulti.run() == WL_CONNECTED) 
+    {
       isFetching = true;
       HTTPClient http;
       http.begin(DATA_URL);
@@ -357,23 +372,24 @@ void setup() {
 
   gfx->begin();
   gfx->fillScreen(COL_BLACK);
+  wifiManager.begin();
+  wifiManager.printStatus();
 
-  // Register WiFi Networks
-  wifiMulti.addAP("Ollie7", WIFI_PASS2);
-  wifiMulti.addAP("Ollie8", WIFI_PASS1);
-  wifiMulti.addAP("Ollie10", WIFI_PASS1);
-
+  // Initialize OTA updates
+  otaUpdater.begin(&wifiManager);
   gfx->setCursor(20, 200);
   gfx->setTextColor(COL_WHITE);
-  gfx->setTextSize(2);
+  gfx->setFont(&FreeSansBold9pt7b); // Set the custom font
+  gfx->setTextSize(1);
   gfx->print("Searching for strongest WiFi...");
+  gfx->setFont(&FreeSansBold9pt7b); // Set the custom font
 
   // Initial Connection
   int f = 0;
-  while (wifiMulti.run() != WL_CONNECTED) {
-    drawSpinnerFrame(f++);
-    delay(100);
-  }
+  //while (wifiMulti.run() != WL_CONNECTED) {
+  //  drawSpinnerFrame(f++);
+  //  delay(100);
+ // }
 
   // Launch Background Task on Core 0
   xTaskCreatePinnedToCore(fetchTask, "FetchData", 10000, NULL, 1, &FetchTaskHandle, 0);
@@ -382,6 +398,9 @@ bool isAsleep = false;
 // --- LOOP (CORE 1) ---
 int spinnerFrame = 0;
 void loop() {
+  wifiManager.handle();
+  otaUpdater.handle();
+
   // 1. Check for Touch to Wake/Reset Timer
   if (GT911.isPressed() > 0) {
     USBSerial.println("Touched");
